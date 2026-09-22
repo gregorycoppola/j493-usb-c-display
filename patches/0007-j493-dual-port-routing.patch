@@ -1,0 +1,528 @@
+diff --git a/drivers/gpu/drm/apple/apple-route.h b/drivers/gpu/drm/apple/apple-route.h
+new file mode 100644
+--- /dev/null
++++ b/drivers/gpu/drm/apple/apple-route.h
+@@ -0,0 +1,18 @@
++/* SPDX-License-Identifier: GPL-2.0-only OR MIT */
++#ifndef APPLE_EXPERIMENTAL_ROUTE_H
++#define APPLE_EXPERIMENTAL_ROUTE_H
++#include <linux/notifier.h>
++#include <linux/property.h>
++
++/* Private j493 experiment ABI, shared by the matching TIPD and DRM modules.
++ * Callbacks run synchronously, serialized by the TIPD route lock. A disconnect
++ * callback completes before TIPD resets that PHY. Never call TIPD from it.
++ */
++struct apple_route_event {
++	struct fwnode_handle *target;
++	u32 port;
++	bool connected;
++};
++int apple_route_register(struct notifier_block *nb);
++void apple_route_unregister(struct notifier_block *nb);
++#endif
+diff --git a/drivers/gpu/drm/apple/dcp-internal.h b/drivers/gpu/drm/apple/dcp-internal.h
+--- a/drivers/gpu/drm/apple/dcp-internal.h
++++ b/drivers/gpu/drm/apple/dcp-internal.h
+@@ -3,6 +3,7 @@
+ 
+ #ifndef __APPLE_DCP_INTERNAL_H__
+ #define __APPLE_DCP_INTERNAL_H__
++#include "apple-route.h"
+ 
+ #include <linux/backlight.h>
+ #include <linux/device.h>
+@@ -260,6 +261,12 @@
+ 	struct dentry *ep_debugfs[0x20];
+ 
+ 	/* these fields are output port specific */
++	bool route_dynamic, route_registered, route_failed;
++	bool route_present[2];
++	int route_active;
++	struct phy *route_phy[2];
++	struct mux_control *route_mux[2];
++	struct notifier_block route_notifier;
+ 	struct phy *phy;
+ 	struct mux_control *xbar;
+ 	struct typec_mux *typec_mux;
+diff --git a/drivers/gpu/drm/apple/dcp-route.c b/drivers/gpu/drm/apple/dcp-route.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/gpu/drm/apple/dcp-route.c
+@@ -0,0 +1,149 @@
++/* SPDX-License-Identifier: GPL-2.0-only OR MIT */
++/* Included by dcp.c. TIPD serializes callbacks across BOTH physical ports. */
++static int dcp_route_error(struct apple_dcp *dcp, const char *stage, int ret)
++{
++	dev_err(dcp->dev, "USB-C route %d: %s failed (%d)\n",
++		dcp->route_active, stage, ret);
++	return ret;
++}
++static int dcp_route_release(struct apple_dcp *dcp)
++{
++	struct dptx_port *port = &dcp->dptxport[0];
++	int ret;
++
++	if (dcp->route_active < 0)
++		return 0;
++	disconnected_hpd_event(dcp->connector);
++	if (dcp->avep)
++		av_service_disconnect(dcp);
++	if (port->connected) {
++		ret = dptxport_set_hpd(port->service, false);
++		if (ret && ret != -EINVAL)
++			return dcp_route_error(dcp, "HPD low", ret);
++		/* The fixed-route driver proceeds to release after HPD low is
++		 * rejected. Preserve that teardown path, but do not surrender the
++		 * route until release AND PHY deactivation are confirmed below.
++		 * Transport failures remain fatal; -EINVAL alone is not success.
++		 */
++		if (ret)
++			dev_warn(dcp->dev, "USB-C route %d: HPD low rejected (%d); verifying display release and PHY deactivation\n",
++				 dcp->route_active, ret);
++		ret = dptxport_release_display(port->service);
++		if (ret)
++			return dcp_route_error(dcp, "release display", ret);
++		/* Do not repoint the PHY while firmware may still deactivate it. */
++		if (!wait_for_completion_timeout(&port->inactive_completion,
++						DPTX_CONNECT_TIMEOUT))
++			return dcp_route_error(dcp, "PHY deactivation", -ETIMEDOUT);
++		port->connected = false;
++	}
++	ret = mux_control_deselect(dcp->route_mux[dcp->route_active]);
++	if (ret)
++		return dcp_route_error(dcp, "crossbar release", ret);
++	dcp->route_active = -1;
++	return 0;
++}
++
++static int dcp_route_connect(struct apple_dcp *dcp, unsigned int route)
++{
++	struct dptx_port *port = &dcp->dptxport[0];
++	int ret;
++
++	if (!port->enabled || !dcp->active || dcp->crashed)
++		return -ENODEV;
++	ret = mux_control_try_select(dcp->route_mux[route], 2);
++	if (ret)
++		return dcp_route_error(dcp, "crossbar select", ret);
++	dcp->route_active = route;
++	dcp->phy = dcp->route_phy[route];
++	dcp->dptx_phy = route;
++	port->atcphy = dcp->phy;
++	reinit_completion(&port->linkcfg_completion);
++	reinit_completion(&port->inactive_completion);
++	/* A failed RPC may already have reached firmware. Retain ownership until
++	 * release/deactivation succeeds, even when connect reports an error. */
++	port->connected = true;
++	ret = dptxport_connect(port->service, 0, route, dcp->dptx_die);
++	if (ret)
++		return dcp_route_error(dcp, "firmware connect", ret);
++	ret = dptxport_request_display(port->service);
++	if (ret)
++		return dcp_route_error(dcp, "request display", ret);
++	/* Match the working fixed-route sequence: this pre-HPD wait is
++	 * advisory. Firmware can defer lane configuration until HPD is high.
++	 * Treating its expiry as fatal prevents us from ever asserting HPD.
++	 * RPC errors and PHY-deactivation timeouts remain fatal below/above.
++	 */
++	if (!wait_for_completion_timeout(&port->linkcfg_completion,
++					DPTX_CONNECT_TIMEOUT))
++		dev_info(dcp->dev, "USB-C route %u: no pre-HPD lane notification; asserting HPD\n",
++			 route);
++	usleep_range(5, 10);
++	ret = dptxport_set_hpd(port->service, true);
++	if (ret)
++		return dcp_route_error(dcp, "HPD high", ret);
++	if (dcp->avep)
++		av_service_connect(dcp);
++	dev_info(dcp->dev, "USB-C route configured for %s port; awaiting display hotplug\n",
++		 route ? "front" : "back");
++	return 0;
++}
++
++static int dcp_route_event(struct notifier_block *nb, unsigned long unused,
++			   void *data)
++{
++	struct apple_dcp *dcp = container_of(nb, struct apple_dcp, route_notifier);
++	struct apple_route_event *event = data;
++	int ret, next;
++
++	if (event->target != dev_fwnode(dcp->dev) || event->port > 1)
++		return NOTIFY_DONE;
++	dcp->route_present[event->port] = event->connected;
++	if (dcp->route_failed)
++		return NOTIFY_OK;
++	/* Charger/USB events on the unused port must not drop the display. */
++	if (!event->connected && dcp->route_active == event->port) {
++		ret = dcp_route_release(dcp);
++		if (ret)
++			goto failed;
++	}
++	/* Keep the existing display if both ports have sinks. */
++	if (dcp->route_active >= 0)
++		return NOTIFY_OK;
++	next = dcp->route_present[0] ? 0 : dcp->route_present[1] ? 1 : -1;
++	if (next < 0)
++		return NOTIFY_OK;
++	ret = dcp_route_connect(dcp, next);
++	if (ret)
++		goto failed;
++	return NOTIFY_OK;
++failed:
++	/* Fail closed: never switch PHYs after an uncertain firmware response. */
++	dcp->route_failed = true;
++	dev_err(dcp->dev, "USB-C route failed (%d); reboot required before another route\n", ret);
++	return NOTIFY_OK;
++}
++
++static int dcp_route_start(struct apple_dcp *dcp)
++{
++	int ret;
++	if (!dcp->route_dynamic || dcp->route_registered)
++		return 0;
++	if (!dcp->dptxport[0].enabled || !dcp->active)
++		return -ENODEV;
++	dcp->route_notifier.notifier_call = dcp_route_event;
++	ret = apple_route_register(&dcp->route_notifier);
++	if (!ret)
++		dcp->route_registered = true;
++	return ret;
++}
++
++static void dcp_route_stop(struct apple_dcp *dcp)
++{
++	if (!dcp->route_registered)
++		return;
++	apple_route_unregister(&dcp->route_notifier);
++	dcp->route_registered = false;
++	if (dcp_route_release(dcp))
++		dcp->route_failed = true;
++}
+diff --git a/drivers/gpu/drm/apple/dcp.c b/drivers/gpu/drm/apple/dcp.c
+--- a/drivers/gpu/drm/apple/dcp.c
++++ b/drivers/gpu/drm/apple/dcp.c
+@@ -452,6 +452,8 @@
+ int dcp_dptx_connect_oob(struct platform_device *pdev, u32 port)
+ {
+ 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
++	if (dcp->route_dynamic)
++		return -EOPNOTSUPP;
+ 	return dcp_dptx_connect(dcp, port);
+ }
+ 
+@@ -459,6 +461,8 @@
+ {
+ 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+ 
++	if (dcp->route_dynamic)
++		return -EOPNOTSUPP;
+ 	disconnected_hpd_event(dcp->connector);
+ 
+ 	if (dcp->avep)
+@@ -469,6 +473,8 @@
+ 
+ 	return dcp_dptx_disconnect(dcp, port);
+ }
++
++#include "dcp-route.c"
+ 
+ static irqreturn_t dcp_dp2hdmi_hpd(int irq, void *data)
+ {
+@@ -636,7 +642,7 @@
+ 	if (dcp->crashed)
+ 		return -ENODEV;
+ 	if (dcp->active)
+-		return dcp_enable_dp2hdmi_hpd(dcp);
++		return dcp->route_dynamic ? dcp_route_start(dcp) : dcp_enable_dp2hdmi_hpd(dcp);
+ 	if (timeout <= 0)
+ 		return -ETIMEDOUT;
+ 
+@@ -647,8 +653,11 @@
+ 	if (dcp->crashed)
+ 		return -ENODEV;
+ 
+-	if (dcp->active)
++	if (dcp->active) {
++		if (dcp->route_dynamic)
++			return dcp_route_start(dcp);
+ 		dcp_enable_dp2hdmi_hpd(dcp);
++	}
+ 
+ 	return dcp->active ? 0 : -ETIMEDOUT;
+ }
+@@ -1123,6 +1132,8 @@
+ 	if (!dcp)
+ 		return;
+ 
++	dcp_route_stop(dcp);
++
+ 	if (dcp->hdmi_hpd_irq)
+ 		disable_irq(dcp->hdmi_hpd_irq);
+ 
+@@ -1210,6 +1221,12 @@
+ 	if (dcp->usb_c_reconnect)
+ 		dev_info(dev, "experimental j493 USB-C reconnect recovery enabled\n");
+ 
++	dcp->route_dynamic = of_property_read_bool(dev->of_node, "apple,dynamic-usb-c");
++	dcp->route_active = -1;
++	if (dcp->route_dynamic && (!dcp->usb_c_reconnect ||
++	    !of_machine_is_compatible("apple,j493") ||
++	    !of_device_is_compatible(dev->of_node, "apple,t8112-dcpext")))
++		return -EINVAL;
+ 	platform_set_drvdata(pdev, dcp);
+ 
+ 	dcp->phy = devm_phy_optional_get(dev, "dp-phy");
+@@ -1218,6 +1235,20 @@
+ 		return PTR_ERR(dcp->phy);
+ 	}
+ 
++	if (dcp->route_dynamic) {
++		dcp->route_phy[0] = dcp->phy;
++		dcp->route_phy[1] = devm_phy_get(dev, "dp-phy-front");
++		if (!dcp->phy)
++			return -ENODEV;
++		if (IS_ERR(dcp->route_phy[1]))
++			return PTR_ERR(dcp->route_phy[1]);
++		dcp->route_mux[0] = devm_mux_control_get(dev, "dp-xbar");
++		dcp->route_mux[1] = devm_mux_control_get(dev, "dp-xbar-front");
++		if (IS_ERR(dcp->route_mux[0]))
++			return PTR_ERR(dcp->route_mux[0]);
++		if (IS_ERR(dcp->route_mux[1]))
++			return PTR_ERR(dcp->route_mux[1]);
++	}
+ 	bitmap_zero(dcp->iomfb_surfaces, DCP_MAX_PLANES);
+ 	if (!of_property_present(dev->of_node, "apple,iomfb-surfaces"))
+ 		num_surfs = 0;
+@@ -1288,7 +1319,7 @@
+ 			return PTR_ERR(dcp->dp2hdmi_pwren);
+ 
+ 		ret = of_property_read_u32(dev->of_node, "mux-index", &mux_index);
+-		if (!ret) {
++		if (!ret && !dcp->route_dynamic) {
+ 			dcp->xbar = devm_mux_control_get(dev, "dp-xbar");
+ 			if (IS_ERR(dcp->xbar)) {
+ 				dev_err(dev, "Failed to get dp-xbar: %ld\n", PTR_ERR(dcp->xbar));
+diff --git a/drivers/gpu/drm/apple/dptxep.c b/drivers/gpu/drm/apple/dptxep.c
+--- a/drivers/gpu/drm/apple/dptxep.c
++++ b/drivers/gpu/drm/apple/dptxep.c
+@@ -499,6 +499,7 @@
+ 
+ 	/* deactivate phy */
+ 	phy_set_mode_ext(dptx->atcphy, PHY_MODE_INVALID, 0);
++	complete(&dptx->inactive_completion);
+ 
+ 	memcpy(reply, data, min(reply_size, data_size));
+ 	if (reply_size >= 4)
+@@ -613,6 +614,8 @@
+ 	u32 port;
+ 	unsigned long timeout = msecs_to_jiffies(1000);
+ 
++	init_completion(&dcp->dptxport[0].inactive_completion);
++	init_completion(&dcp->dptxport[1].inactive_completion);
+ 	init_completion(&dcp->dptxport[0].enable_completion);
+ 	init_completion(&dcp->dptxport[1].enable_completion);
+ 	init_completion(&dcp->dptxport[0].linkcfg_completion);
+diff --git a/drivers/gpu/drm/apple/dptxep.h b/drivers/gpu/drm/apple/dptxep.h
+--- a/drivers/gpu/drm/apple/dptxep.h
++++ b/drivers/gpu/drm/apple/dptxep.h
+@@ -50,6 +50,7 @@
+ 	bool enabled, connected;
+ 	struct completion enable_completion;
+ 	struct completion linkcfg_completion;
++	struct completion inactive_completion;
+ 	u32 unit;
+ 	struct apple_epic_service *service;
+ 	union phy_configure_opts phy_ops;
+diff --git a/drivers/usb/typec/tipd/apple-route.h b/drivers/usb/typec/tipd/apple-route.h
+new file mode 100644
+--- /dev/null
++++ b/drivers/usb/typec/tipd/apple-route.h
+@@ -0,0 +1,18 @@
++/* SPDX-License-Identifier: GPL-2.0-only OR MIT */
++#ifndef APPLE_EXPERIMENTAL_ROUTE_H
++#define APPLE_EXPERIMENTAL_ROUTE_H
++#include <linux/notifier.h>
++#include <linux/property.h>
++
++/* Private j493 experiment ABI, shared by the matching TIPD and DRM modules.
++ * Callbacks run synchronously, serialized by the TIPD route lock. A disconnect
++ * callback completes before TIPD resets that PHY. Never call TIPD from it.
++ */
++struct apple_route_event {
++	struct fwnode_handle *target;
++	u32 port;
++	bool connected;
++};
++int apple_route_register(struct notifier_block *nb);
++void apple_route_unregister(struct notifier_block *nb);
++#endif
+diff --git a/drivers/usb/typec/tipd/core.c b/drivers/usb/typec/tipd/core.c
+--- a/drivers/usb/typec/tipd/core.c
++++ b/drivers/usb/typec/tipd/core.c
+@@ -24,6 +24,9 @@
+ #include <linux/firmware.h>
+ 
+ #include "tps6598x.h"
++#include <linux/of.h>
++#include "apple-route.h"
++#include "route-broker.c"
+ #include "trace.h"
+ 
+ /* Register offsets */
+@@ -685,8 +688,8 @@
+ 	if (old_role != USB_ROLE_NONE && (new_role != old_role || was_disconnected))
+ 		usb_role_switch_set_role(tps->role_sw, USB_ROLE_NONE);
+ 
+-	if (cd321x->connector_fwnode && (!dp_hpd || dp_hpd_changed)) {
+-		drm_connector_oob_hotplug_event(cd321x->connector_fwnode, connector_status_disconnected);
++	if (cd321x->connector_fwnode && (!dp_hpd || dp_hpd_changed || !new_connected || was_disconnected)) {
++		cd321x_route_event(cd321x, false);
+ 	}
+ 
+ 	/* Process partner disconnection or change */
+@@ -746,7 +749,7 @@
+ 	usb_role_switch_set_role(tps->role_sw, new_role);
+ 
+ 	if (cd321x->connector_fwnode && dp_hpd)
+-		drm_connector_oob_hotplug_event(cd321x->connector_fwnode, connector_status_connected);
++		cd321x_route_event(cd321x, true);
+ 
+ 	power_supply_changed(tps->psy);
+ }
+@@ -1207,6 +1210,14 @@
+ 	if (!IS_ERR_OR_NULL(connector_fwnode))
+ 		cd321x->connector_fwnode = connector_fwnode;
+ 
++	ret = cd321x_route_add(cd321x, fwnode);
++	if (ret) {
++		typec_mux_put(cd321x->mux);
++		fwnode_handle_put(cd321x->connector_fwnode);
++		cd321x->connector_fwnode = NULL;
++		goto err_unregister_altmodes;
++	}
++
+ 	cd321x->state.alt = NULL;
+ 	cd321x->state.mode = TYPEC_STATE_SAFE;
+ 	cd321x->state.data = NULL;
+@@ -1235,6 +1246,9 @@
+ {
+ 	struct cd321x *cd321x = container_of(tps, struct cd321x, tps);
+ 
++	cd321x_route_remove(cd321x);
++	fwnode_handle_put(cd321x->connector_fwnode);
++	cd321x->connector_fwnode = NULL;
+ 	typec_mux_put(cd321x->mux);
+ 	cd321x->mux = NULL;
+ 	typec_unregister_altmode(cd321x->port_altmode_dp);
+diff --git a/drivers/usb/typec/tipd/route-broker.c b/drivers/usb/typec/tipd/route-broker.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/usb/typec/tipd/route-broker.c
+@@ -0,0 +1,94 @@
++/* SPDX-License-Identifier: GPL-2.0-only OR MIT */
++/* Included by TIPD core; deliberately restricted to j493 and two ports. */
++static DEFINE_MUTEX(apple_route_lock);
++static BLOCKING_NOTIFIER_HEAD(apple_route_chain);
++static struct cd321x *apple_route_ports[2];
++
++int apple_route_register(struct notifier_block *nb)
++{
++	int ret, i;
++
++	mutex_lock(&apple_route_lock);
++	ret = blocking_notifier_chain_register(&apple_route_chain, nb);
++	if (!ret) {
++		for (i = 0; i < 2; i++) {
++			struct cd321x *cd = apple_route_ports[i];
++			struct apple_route_event event;
++			if (!cd)
++				continue;
++			event.target = cd->connector_fwnode;
++			event.port = i;
++			event.connected = cd->route_connected;
++			nb->notifier_call(nb, 0, &event);
++		}
++	}
++	mutex_unlock(&apple_route_lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(apple_route_register);
++
++void apple_route_unregister(struct notifier_block *nb)
++{
++	mutex_lock(&apple_route_lock);
++	blocking_notifier_chain_unregister(&apple_route_chain, nb);
++	mutex_unlock(&apple_route_lock);
++}
++EXPORT_SYMBOL_GPL(apple_route_unregister);
++
++static void cd321x_route_event(struct cd321x *cd, bool connected)
++{
++	struct apple_route_event event = {
++		.target = cd->connector_fwnode,
++		.port = cd->route_port,
++		.connected = connected,
++	};
++	if (!cd->connector_fwnode)
++		return;
++	if (!cd->route_dynamic) {
++		drm_connector_oob_hotplug_event(cd->connector_fwnode,
++			connected ? connector_status_connected : connector_status_disconnected);
++		return;
++	}
++	mutex_lock(&apple_route_lock);
++	cd->route_connected = connected;
++	blocking_notifier_call_chain(&apple_route_chain, 0, &event);
++	mutex_unlock(&apple_route_lock);
++}
++
++static int cd321x_route_add(struct cd321x *cd, struct fwnode_handle *fwnode)
++{
++	u32 port;
++	int ret = 0;
++	if (!fwnode_property_present(fwnode, "apple,display-route"))
++		return 0;
++	if (!of_machine_is_compatible("apple,j493") || !cd->connector_fwnode ||
++	    fwnode_property_read_u32(fwnode, "apple,display-route", &port) || port > 1)
++		return -EINVAL;
++	mutex_lock(&apple_route_lock);
++	if (apple_route_ports[port]) {
++		ret = -EBUSY;
++	} else {
++		cd->route_port = port;
++		cd->route_dynamic = true;
++		apple_route_ports[port] = cd;
++	}
++	mutex_unlock(&apple_route_lock);
++	return ret;
++}
++
++static void cd321x_route_remove(struct cd321x *cd)
++{
++	struct apple_route_event event = {
++		.target = cd->connector_fwnode,
++		.port = cd->route_port,
++		.connected = false,
++	};
++	if (cd->route_dynamic) {
++		mutex_lock(&apple_route_lock);
++		cd->route_connected = false;
++		blocking_notifier_call_chain(&apple_route_chain, 0, &event);
++		apple_route_ports[cd->route_port] = NULL;
++		cd->route_dynamic = false;
++		mutex_unlock(&apple_route_lock);
++	}
++}
+diff --git a/drivers/usb/typec/tipd/tps6598x.h b/drivers/usb/typec/tipd/tps6598x.h
+--- a/drivers/usb/typec/tipd/tps6598x.h
++++ b/drivers/usb/typec/tipd/tps6598x.h
+@@ -375,6 +375,8 @@
+ 	struct usb_pd_identity cur_partner_identity;
+ 
+ 	struct fwnode_handle *connector_fwnode;
++	bool route_dynamic, route_connected;
++	u32 route_port;
+ };
+ 
+ struct sn201202x {
