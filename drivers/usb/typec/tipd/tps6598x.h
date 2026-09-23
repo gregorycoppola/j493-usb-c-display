@@ -375,6 +375,8 @@ struct cd321x {
 	struct usb_pd_identity cur_partner_identity;
 
 	struct fwnode_handle *connector_fwnode;
+	bool route_dynamic, route_connected;
+	u32 route_port;
 };
 
 struct sn201202x {

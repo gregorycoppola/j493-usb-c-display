@@ -452,6 +452,8 @@ static int dcp_dptx_disconnect(struct apple_dcp *dcp, u32 port)
 int dcp_dptx_connect_oob(struct platform_device *pdev, u32 port)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+	if (dcp->route_dynamic)
+		return -EOPNOTSUPP;
 	return dcp_dptx_connect(dcp, port);
 }
 
@@ -459,6 +461,8 @@ int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 
+	if (dcp->route_dynamic)
+		return -EOPNOTSUPP;
 	disconnected_hpd_event(dcp->connector);
 
 	if (dcp->avep)
@@ -469,6 +473,8 @@ int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port)
 
 	return dcp_dptx_disconnect(dcp, port);
 }
+
+#include "dcp-route.c"
 
 static irqreturn_t dcp_dp2hdmi_hpd(int irq, void *data)
 {
@@ -636,7 +642,7 @@ int dcp_wait_ready(struct platform_device *pdev, u64 timeout)
 	if (dcp->crashed)
 		return -ENODEV;
 	if (dcp->active)
-		return dcp_enable_dp2hdmi_hpd(dcp);
+		return dcp->route_dynamic ? dcp_route_start(dcp) : dcp_enable_dp2hdmi_hpd(dcp);
 	if (timeout <= 0)
 		return -ETIMEDOUT;
 
@@ -647,8 +653,11 @@ int dcp_wait_ready(struct platform_device *pdev, u64 timeout)
 	if (dcp->crashed)
 		return -ENODEV;
 
-	if (dcp->active)
+	if (dcp->active) {
+		if (dcp->route_dynamic)
+			return dcp_route_start(dcp);
 		dcp_enable_dp2hdmi_hpd(dcp);
+	}
 
 	return dcp->active ? 0 : -ETIMEDOUT;
 }
@@ -1123,6 +1132,8 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 	if (!dcp)
 		return;
 
+	dcp_route_stop(dcp);
+
 	if (dcp->hdmi_hpd_irq)
 		disable_irq(dcp->hdmi_hpd_irq);
 
@@ -1210,6 +1221,12 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	if (dcp->usb_c_reconnect)
 		dev_info(dev, "experimental j493 USB-C reconnect recovery enabled\n");
 
+	dcp->route_dynamic = of_property_read_bool(dev->of_node, "apple,dynamic-usb-c");
+	dcp->route_active = -1;
+	if (dcp->route_dynamic && (!dcp->usb_c_reconnect ||
+	    !of_machine_is_compatible("apple,j493") ||
+	    !of_device_is_compatible(dev->of_node, "apple,t8112-dcpext")))
+		return -EINVAL;
 	platform_set_drvdata(pdev, dcp);
 
 	dcp->phy = devm_phy_optional_get(dev, "dp-phy");
@@ -1218,6 +1235,20 @@ static int dcp_platform_probe(struct platform_device *pdev)
 		return PTR_ERR(dcp->phy);
 	}
 
+	if (dcp->route_dynamic) {
+		dcp->route_phy[0] = dcp->phy;
+		dcp->route_phy[1] = devm_phy_get(dev, "dp-phy-front");
+		if (!dcp->phy)
+			return -ENODEV;
+		if (IS_ERR(dcp->route_phy[1]))
+			return PTR_ERR(dcp->route_phy[1]);
+		dcp->route_mux[0] = devm_mux_control_get(dev, "dp-xbar");
+		dcp->route_mux[1] = devm_mux_control_get(dev, "dp-xbar-front");
+		if (IS_ERR(dcp->route_mux[0]))
+			return PTR_ERR(dcp->route_mux[0]);
+		if (IS_ERR(dcp->route_mux[1]))
+			return PTR_ERR(dcp->route_mux[1]);
+	}
 	bitmap_zero(dcp->iomfb_surfaces, DCP_MAX_PLANES);
 	if (!of_property_present(dev->of_node, "apple,iomfb-surfaces"))
 		num_surfs = 0;
@@ -1288,7 +1319,7 @@ static int dcp_platform_probe(struct platform_device *pdev)
 			return PTR_ERR(dcp->dp2hdmi_pwren);
 
 		ret = of_property_read_u32(dev->of_node, "mux-index", &mux_index);
-		if (!ret) {
+		if (!ret && !dcp->route_dynamic) {
 			dcp->xbar = devm_mux_control_get(dev, "dp-xbar");
 			if (IS_ERR(dcp->xbar)) {
 				dev_err(dev, "Failed to get dp-xbar: %ld\n", PTR_ERR(dcp->xbar));

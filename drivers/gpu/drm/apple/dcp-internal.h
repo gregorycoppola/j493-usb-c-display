@@ -3,6 +3,7 @@
 
 #ifndef __APPLE_DCP_INTERNAL_H__
 #define __APPLE_DCP_INTERNAL_H__
+#include "apple-route.h"
 
 #include <linux/backlight.h>
 #include <linux/device.h>
@@ -260,6 +261,12 @@ struct apple_dcp {
 	struct dentry *ep_debugfs[0x20];
 
 	/* these fields are output port specific */
+	bool route_dynamic, route_registered, route_failed;
+	bool route_present[2];
+	int route_active;
+	struct phy *route_phy[2];
+	struct mux_control *route_mux[2];
+	struct notifier_block route_notifier;
 	struct phy *phy;
 	struct mux_control *xbar;
 	struct typec_mux *typec_mux;

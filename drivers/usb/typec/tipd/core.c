@@ -24,6 +24,9 @@
 #include <linux/firmware.h>
 
 #include "tps6598x.h"
+#include <linux/of.h>
+#include "apple-route.h"
+#include "route-broker.c"
 #include "trace.h"
 
 /* Register offsets */
@@ -685,8 +688,8 @@ static void cd321x_update_work(struct work_struct *work)
 	if (old_role != USB_ROLE_NONE && (new_role != old_role || was_disconnected))
 		usb_role_switch_set_role(tps->role_sw, USB_ROLE_NONE);
 
-	if (cd321x->connector_fwnode && (!dp_hpd || dp_hpd_changed)) {
-		drm_connector_oob_hotplug_event(cd321x->connector_fwnode, connector_status_disconnected);
+	if (cd321x->connector_fwnode && (!dp_hpd || dp_hpd_changed || !new_connected || was_disconnected)) {
+		cd321x_route_event(cd321x, false);
 	}
 
 	/* Process partner disconnection or change */
@@ -746,7 +749,7 @@ static void cd321x_update_work(struct work_struct *work)
 	usb_role_switch_set_role(tps->role_sw, new_role);
 
 	if (cd321x->connector_fwnode && dp_hpd)
-		drm_connector_oob_hotplug_event(cd321x->connector_fwnode, connector_status_connected);
+		cd321x_route_event(cd321x, true);
 
 	power_supply_changed(tps->psy);
 }
@@ -1207,6 +1210,14 @@ cd321x_register_port(struct tps6598x *tps, struct fwnode_handle *fwnode)
 	if (!IS_ERR_OR_NULL(connector_fwnode))
 		cd321x->connector_fwnode = connector_fwnode;
 
+	ret = cd321x_route_add(cd321x, fwnode);
+	if (ret) {
+		typec_mux_put(cd321x->mux);
+		fwnode_handle_put(cd321x->connector_fwnode);
+		cd321x->connector_fwnode = NULL;
+		goto err_unregister_altmodes;
+	}
+
 	cd321x->state.alt = NULL;
 	cd321x->state.mode = TYPEC_STATE_SAFE;
 	cd321x->state.data = NULL;
@@ -1235,6 +1246,9 @@ cd321x_unregister_port(struct tps6598x *tps)
 {
 	struct cd321x *cd321x = container_of(tps, struct cd321x, tps);
 
+	cd321x_route_remove(cd321x);
+	fwnode_handle_put(cd321x->connector_fwnode);
+	cd321x->connector_fwnode = NULL;
 	typec_mux_put(cd321x->mux);
 	cd321x->mux = NULL;
 	typec_unregister_altmode(cd321x->port_altmode_dp);
