@@ -192,6 +192,8 @@ struct apple_dcp {
 	 */
 	atomic_t hdmi_generation;
 	int hdmi_recovered;
+	/* Opt-in j493 USB-C recovery; hdmi_* counters also track this route. */
+	bool usb_c_reconnect;
 	bool use_timestamps;
 	struct dcp_set_digital_out_mode_req mode;
 

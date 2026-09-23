@@ -432,7 +432,7 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 		return 0;
 
 	generation = atomic_read(&dcp->hdmi_generation);
-	recover = dcp->hdmi_hpd &&
+	recover = (dcp->hdmi_hpd || dcp->usb_c_reconnect) &&
 		generation != READ_ONCE(dcp->hdmi_recovered);
 	if (recover) {
 		if (!READ_ONCE(dcp->connector->connected))

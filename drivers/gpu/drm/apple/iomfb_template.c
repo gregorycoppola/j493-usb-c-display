@@ -1033,7 +1033,10 @@ static void dcpep_cb_hotplug(struct apple_dcp *dcp, u64 *connected)
 
 	/* Hotplug invalidates mode. DRM doesn't always handle this. */
 	if (!(*connected)) {
-		if (dcp->hdmi_hpd)
+		/* A hub's downstream HDMI HPD reaches us through firmware,
+		 * without the built-in HDMI GPIO IRQ. Reuse its recovery path.
+		 */
+		if (dcp->hdmi_hpd || dcp->usb_c_reconnect)
 			atomic_inc(&dcp->hdmi_generation);
 		dcp->valid_mode = false;
 		/* after unplug swap will not complete until the next

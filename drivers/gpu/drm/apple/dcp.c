@@ -50,6 +50,17 @@ static bool show_notch;
 module_param(show_notch, bool, 0644);
 MODULE_PARM_DESC(show_notch, "Use the full display height and shows the notch");
 
+static bool usb_c_reconnect;
+module_param(usb_c_reconnect, bool, 0444);
+MODULE_PARM_DESC(usb_c_reconnect,
+	"Experimental HDMI-through-USB-C reconnect recovery on j493/t8112 dcpext");
+
+static bool dcp_usb_c_reconnect_enabled(struct apple_dcp *dcp)
+{
+	return usb_c_reconnect && of_machine_is_compatible("apple,j493") &&
+		of_device_is_compatible(dcp->dev->of_node, "apple,t8112-dcpext");
+}
+
 bool hdmi_audio;
 module_param(hdmi_audio, bool, 0644);
 MODULE_PARM_DESC(hdmi_audio, "Enable unstable HDMI audio support");
@@ -331,7 +342,7 @@ bool dcp_needs_recovery(struct platform_device *pdev)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 
-	return dcp->hdmi_hpd &&
+	return (dcp->hdmi_hpd || dcp->usb_c_reconnect) &&
 		atomic_read(&dcp->hdmi_generation) != READ_ONCE(dcp->hdmi_recovered);
 }
 
@@ -1195,6 +1206,9 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	dcp->fw_compat = fw_compat;
 	dcp->dev = dev;
 	dcp->hw = *(struct apple_dcp_hw_data *)of_device_get_match_data(dev);
+	dcp->usb_c_reconnect = dcp_usb_c_reconnect_enabled(dcp);
+	if (dcp->usb_c_reconnect)
+		dev_info(dev, "experimental j493 USB-C reconnect recovery enabled\n");
 
 	platform_set_drvdata(pdev, dcp);
 
