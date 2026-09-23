@@ -324,3 +324,24 @@
 
 #include "hwmon-fan.dtsi"
 #include "hwmon-laptop.dtsi"
+
+// j493: one external display, dynamically routed to either physical USB-C port.
+&typec0 {
+	displayport = <&dcpext>;
+	apple,display-route = <0>;
+};
+&typec1 {
+	displayport = <&dcpext>;
+	apple,display-route = <1>;
+};
+&dcpext {
+	apple,dynamic-usb-c;
+	apple,dptx-phy = <0>;
+	phys = <&atcphy0 PHY_TYPE_DP>, <&atcphy1 PHY_TYPE_DP>;
+	phy-names = "dp-phy", "dp-phy-front";
+	mux-controls = <&atcphy0_xbar 0>, <&atcphy1_xbar 0>;
+	mux-control-names = "dp-xbar", "dp-xbar-front";
+};
+&ps_atc0_common {
+	apple,always-on;
+};
