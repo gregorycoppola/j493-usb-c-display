@@ -41,6 +41,12 @@ The commands prepare source and run tests. Kernel/module building and boot deplo
 
 ## Evidence and remaining limitations
 
+**September 23:** the owner reports continued successful use. Read-only checks
+confirmed the published implementation rebuilt for `7.1.13-3-2-ARCH` is loaded,
+both installed boot files match that rebuild, and the Samsung is active at
+1080p/60 Hz. See [running setup and demo notes](docs/running-setup-2026-09-23.md)
+for verification details and the remaining wake limitation.
+
 On September 21, 2026, the owner reported successful startup on either port, hub movement between ports, HDMI unplug/replug on either port, and monitor power cycling. Hardware: j493, CASA Hub A01, Samsung LS27D300G at 1920×1080/60 Hz, kernel `7.1.13-2-1-ARCH`. Installed artifacts and loaded drivers were verified as build-005. Cycle counts and individual recovery timings were not recorded.
 
 On September 22 the owner reported another black/off screen after an automatic lock and display power-off/wake sequence. Linux reported the output connected/enabled; the cause remains unknown. A later cable replug and software wake tests overlapped, so neither can be credited with recovery. See the [dated incident record](docs/idle-wake-blackout-2026-09-22.md). **Blackout-free operation is not established.** Whole-system suspend/resume on this build, rapid hotplug, other adapters/models, simultaneous sinks, and long-term reliability remain unvalidated. Kernel/package updates do not preserve the original experimental deployment.
