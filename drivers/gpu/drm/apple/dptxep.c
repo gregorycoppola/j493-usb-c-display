@@ -499,6 +499,7 @@ dptxport_call_deactivate(struct apple_epic_service *service,
 
 	/* deactivate phy */
 	phy_set_mode_ext(dptx->atcphy, PHY_MODE_INVALID, 0);
+	complete(&dptx->inactive_completion);
 
 	memcpy(reply, data, min(reply_size, data_size));
 	if (reply_size >= 4)
@@ -613,6 +614,8 @@ int dptxep_init(struct apple_dcp *dcp)
 	u32 port;
 	unsigned long timeout = msecs_to_jiffies(1000);
 
+	init_completion(&dcp->dptxport[0].inactive_completion);
+	init_completion(&dcp->dptxport[1].inactive_completion);
 	init_completion(&dcp->dptxport[0].enable_completion);
 	init_completion(&dcp->dptxport[1].enable_completion);
 	init_completion(&dcp->dptxport[0].linkcfg_completion);

@@ -6,6 +6,8 @@
  * Author: Heikki Krogerus <heikki.krogerus@linux.intel.com>
  */
 
+#include <drm/drm_connector.h>
+
 #include <linux/i2c.h>
 #include <linux/acpi.h>
 #include <linux/gpio/consumer.h>
@@ -22,6 +24,9 @@
 #include <linux/firmware.h>
 
 #include "tps6598x.h"
+#include <linux/of.h>
+#include "apple-route.h"
+#include "route-broker.c"
 #include "trace.h"
 
 /* Register offsets */
@@ -643,6 +648,7 @@ static void cd321x_update_work(struct work_struct *work)
 
 	st = cd321x->update_status;
 	cd321x->update_status.status_changed = 0;
+	cd321x->update_status.data_status_changed = 0;
 
 	bool old_connected = !!tps->partner;
 	bool new_connected = st.status & TPS_STATUS_PLUG_PRESENT;
@@ -650,6 +656,9 @@ static void cd321x_update_work(struct work_struct *work)
 
 	bool usb_connection = st.data_status &
 			      (TPS_DATA_STATUS_USB2_CONNECTION | TPS_DATA_STATUS_USB3_CONNECTION);
+
+	bool dp_hpd = st.data_status & CD321X_DATA_STATUS_HPD_LEVEL;
+	bool dp_hpd_changed = st.data_status_changed & CD321X_DATA_STATUS_HPD_LEVEL;
 
 	enum usb_role old_role = usb_role_switch_get_role(tps->role_sw);
 	enum usb_role new_role = USB_ROLE_NONE;
@@ -678,6 +687,10 @@ static void cd321x_update_work(struct work_struct *work)
 	/* If we are switching from an active role, transition to USB_ROLE_NONE first */
 	if (old_role != USB_ROLE_NONE && (new_role != old_role || was_disconnected))
 		usb_role_switch_set_role(tps->role_sw, USB_ROLE_NONE);
+
+	if (cd321x->connector_fwnode && (!dp_hpd || dp_hpd_changed || !new_connected || was_disconnected)) {
+		cd321x_route_event(cd321x, false);
+	}
 
 	/* Process partner disconnection or change */
 	if (!new_connected || partner_changed) {
@@ -735,12 +748,16 @@ static void cd321x_update_work(struct work_struct *work)
 	/* Launch the USB role switch */
 	usb_role_switch_set_role(tps->role_sw, new_role);
 
+	if (cd321x->connector_fwnode && dp_hpd)
+		cd321x_route_event(cd321x, true);
+
 	power_supply_changed(tps->psy);
 }
 
 static void cd321x_queue_status(struct cd321x *cd321x)
 {
 	cd321x->update_status.status_changed |= cd321x->update_status.status ^ cd321x->tps.status;
+	cd321x->update_status.data_status_changed |= cd321x->update_status.data_status ^ cd321x->tps.data_status;
 
 	cd321x->update_status.status = cd321x->tps.status;
 	cd321x->update_status.pwr_status = cd321x->tps.pwr_status;
@@ -1169,6 +1186,7 @@ static int
 cd321x_register_port(struct tps6598x *tps, struct fwnode_handle *fwnode)
 {
 	struct cd321x *cd321x = container_of(tps, struct cd321x, tps);
+	struct fwnode_handle *connector_fwnode = NULL;
 	int ret;
 
 	INIT_DELAYED_WORK(&cd321x->update_work, cd321x_update_work);
@@ -1184,6 +1202,19 @@ cd321x_register_port(struct tps6598x *tps, struct fwnode_handle *fwnode)
 	cd321x->mux = fwnode_typec_mux_get(fwnode);
 	if (IS_ERR(cd321x->mux)) {
 		ret = PTR_ERR(cd321x->mux);
+		goto err_unregister_altmodes;
+	}
+
+	if (fwnode_property_present(fwnode, "displayport"))
+		connector_fwnode = fwnode_find_reference(fwnode, "displayport", 0);
+	if (!IS_ERR_OR_NULL(connector_fwnode))
+		cd321x->connector_fwnode = connector_fwnode;
+
+	ret = cd321x_route_add(cd321x, fwnode);
+	if (ret) {
+		typec_mux_put(cd321x->mux);
+		fwnode_handle_put(cd321x->connector_fwnode);
+		cd321x->connector_fwnode = NULL;
 		goto err_unregister_altmodes;
 	}
 
@@ -1215,6 +1246,9 @@ cd321x_unregister_port(struct tps6598x *tps)
 {
 	struct cd321x *cd321x = container_of(tps, struct cd321x, tps);
 
+	cd321x_route_remove(cd321x);
+	fwnode_handle_put(cd321x->connector_fwnode);
+	cd321x->connector_fwnode = NULL;
 	typec_mux_put(cd321x->mux);
 	cd321x->mux = NULL;
 	typec_unregister_altmode(cd321x->port_altmode_dp);

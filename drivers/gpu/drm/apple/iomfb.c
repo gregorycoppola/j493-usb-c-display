@@ -415,6 +415,8 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 	struct drm_crtc_state *crtc_state;
 	int ret = -EIO;
 	bool modeset;
+	bool recover;
+	int generation;
 
 	crtc_state = drm_atomic_get_new_crtc_state(state, crtc);
 	if (!crtc_state)
@@ -429,6 +431,19 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 	if (crtc_state->mode.hdisplay == 0 && crtc_state->mode.vdisplay == 0)
 		return 0;
 
+	generation = atomic_read(&dcp->hdmi_generation);
+	recover = (dcp->hdmi_hpd || dcp->usb_c_reconnect) &&
+		generation != READ_ONCE(dcp->hdmi_recovered);
+	if (recover) {
+		if (!READ_ONCE(dcp->connector->connected))
+			return -ENOLINK;
+		/* HPD can power firmware down without changing DRM active. */
+		ret = dcp_poweron(apple_crtc->dcp);
+		if (ret)
+			return ret;
+		crtc_state->color_mgmt_changed = true;
+	}
+
 	switch (dcp->fw_compat) {
 	case DCP_FIRMWARE_V_12_3:
 		ret = iomfb_modeset_v12_3(dcp, crtc_state);
@@ -442,6 +457,9 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 		break;
 	}
 
+	/* Never consume a disconnect that raced the power/mode ACKs. */
+	if (!ret && recover)
+		WRITE_ONCE(dcp->hdmi_recovered, generation);
 	return ret;
 }
 
@@ -462,6 +480,15 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_state *state)
 {
 	struct platform_device *pdev = to_apple_crtc(crtc)->dcp;
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	/* HPD may race atomic_check or the mode ACK. Do not submit a swap
+	 * into powered-down firmware; deliver the owned event normally.
+	 * The next permitted modeset will retry the unconsumed generation.
+	 */
+	if (dcp_needs_recovery(pdev)) {
+		schedule_work(&dcp->vblank_wq);
+		return;
+	}
 
 	if (dcp_channel_busy(&dcp->ch_cmd))
 	{

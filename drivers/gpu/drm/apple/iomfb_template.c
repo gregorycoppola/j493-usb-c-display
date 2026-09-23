@@ -799,7 +799,7 @@ static void dcp_on_set_parameter(struct apple_dcp *dcp, void *out, void *cookie)
 	dcp_set_parameter_dcp(dcp, false, &param, dcp_on_set_power_state, cookie);
 }
 
-void DCP_FW_NAME(iomfb_poweron)(struct apple_dcp *dcp)
+int DCP_FW_NAME(iomfb_poweron)(struct apple_dcp *dcp)
 {
 	struct dcp_wait_cookie *cookie;
 	int ret;
@@ -808,7 +808,7 @@ void DCP_FW_NAME(iomfb_poweron)(struct apple_dcp *dcp)
 
 	cookie = kzalloc(sizeof(*cookie), GFP_KERNEL);
 	if (!cookie)
-		return;
+		return -ENOMEM;
 
 	init_completion(&cookie->done);
 	kref_init(&cookie->refcount);
@@ -844,6 +844,7 @@ void DCP_FW_NAME(iomfb_poweron)(struct apple_dcp *dcp)
 
 	/* Force a brightness update after poweron, to restore the brightness */
 	dcp->brightness.update = true;
+	return ret > 0 ? 0 : -ETIMEDOUT;
 }
 
 static void complete_set_powerstate(struct apple_dcp *dcp, void *out,
@@ -1032,6 +1033,11 @@ static void dcpep_cb_hotplug(struct apple_dcp *dcp, u64 *connected)
 
 	/* Hotplug invalidates mode. DRM doesn't always handle this. */
 	if (!(*connected)) {
+		/* A hub's downstream HDMI HPD reaches us through firmware,
+		 * without the built-in HDMI GPIO IRQ. Reuse its recovery path.
+		 */
+		if (dcp->hdmi_hpd || dcp->usb_c_reconnect)
+			atomic_inc(&dcp->hdmi_generation);
 		dcp->valid_mode = false;
 		/* after unplug swap will not complete until the next
 		 * set_digital_out_mode */
