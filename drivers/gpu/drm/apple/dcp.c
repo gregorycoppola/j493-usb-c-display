@@ -327,6 +327,14 @@ void dcp_send_message(struct apple_dcp *dcp, u8 endpoint, u64 message)
 				 true);
 }
 
+bool dcp_needs_recovery(struct platform_device *pdev)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	return dcp->hdmi_hpd &&
+		atomic_read(&dcp->hdmi_generation) != READ_ONCE(dcp->hdmi_recovered);
+}
+
 int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state *state)
 {
 	struct platform_device *pdev = to_apple_crtc(crtc)->dcp;
@@ -463,6 +471,9 @@ static irqreturn_t dcp_dp2hdmi_hpd(int irq, void *data)
 	 * IRQs might be helpful for debugging.
 	 */
 	dev_info(dcp->dev, "DP2HDMI HPD irq, connected:%d\n", connected);
+	/* Invalidate even if firmware gates its callback during a modeset. */
+	if (!connected)
+		atomic_inc(&dcp->hdmi_generation);
 
 	if (connected) {
 		msleep(500);
@@ -646,9 +657,10 @@ static void __maybe_unused dcp_sleep(struct apple_dcp *dcp)
 	}
 }
 
-void dcp_poweron(struct platform_device *pdev)
+int dcp_poweron(struct platform_device *pdev)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+	int ret;
 
 	if (dcp->hdmi_hpd) {
 		bool connected = gpiod_get_value_cansleep(dcp->hdmi_hpd);
@@ -660,18 +672,21 @@ void dcp_poweron(struct platform_device *pdev)
 
 	switch (dcp->fw_compat) {
 	case DCP_FIRMWARE_V_12_3:
-		iomfb_poweron_v12_3(dcp);
+		ret = iomfb_poweron_v12_3(dcp);
 		break;
 	case DCP_FIRMWARE_V_13_5:
-		iomfb_poweron_v13_3(dcp);
+		ret = iomfb_poweron_v13_3(dcp);
 		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
-		break;
+		return -EINVAL;
 	}
 
+	if (ret)
+		return ret;
 	if (dcp->avep)
 		av_service_connect(dcp);
+	return 0;
 }
 
 void dcp_poweroff(struct platform_device *pdev)
@@ -996,6 +1011,7 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 		dev_info(dev, "DCP index:%u dptx target phy: %u dptx die: %u\n",
 			 dcp->index, dcp->dptx_phy, dcp->dptx_die);
 	mutex_init(&dcp->hpd_mutex);
+	atomic_set(&dcp->hdmi_generation, 0);
 
 	if (!show_notch)
 		ret = of_property_read_u32(dev->of_node, "apple,notch-height",

@@ -30,7 +30,8 @@ struct apple_encoder {
 #define to_apple_encoder(x) container_of(x, struct apple_encoder, base)
 
 void dcp_poweroff(struct platform_device *pdev);
-void dcp_poweron(struct platform_device *pdev);
+int dcp_poweron(struct platform_device *pdev);
+bool dcp_needs_recovery(struct platform_device *pdev);
 int dcp_set_crc(struct drm_crtc *crtc, bool enabled);
 int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state *state);
 int dcp_get_connector_type(struct platform_device *pdev);

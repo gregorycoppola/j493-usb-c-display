@@ -187,6 +187,11 @@ struct apple_dcp {
 	/* Current display mode */
 	bool during_modeset;
 	bool valid_mode;
+	/* HDMI disconnect generation; recovery is consumed only after mode ACK.
+	 * IRQ/RTKit increment the generation; the CRTC commit tail owns recovered.
+	 */
+	atomic_t hdmi_generation;
+	int hdmi_recovered;
 	bool use_timestamps;
 	struct dcp_set_digital_out_mode_req mode;
 

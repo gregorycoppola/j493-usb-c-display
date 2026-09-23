@@ -106,9 +106,11 @@ static void apple_crtc_atomic_enable(struct drm_crtc *crtc,
 	struct drm_crtc_state *crtc_state;
 	crtc_state = drm_atomic_get_new_crtc_state(state, crtc);
 
-	if (crtc_state->active_changed && crtc_state->active) {
+	if (crtc_state->active_changed && crtc_state->active &&
+	    !dcp_needs_recovery(to_apple_crtc(crtc)->dcp)) {
 		struct apple_crtc *apple_crtc = to_apple_crtc(crtc);
-		dcp_poweron(apple_crtc->dcp);
+		if (dcp_poweron(apple_crtc->dcp))
+			return;
 		/* Force the CTM to be set on first swap */
 		crtc_state->color_mgmt_changed = true;
 	}
@@ -223,8 +225,27 @@ static const struct drm_crtc_funcs apple_crtc_funcs = {
 
 };
 
+static int apple_atomic_check(struct drm_device *dev,
+			      struct drm_atomic_state *state)
+{
+	struct drm_crtc *crtc;
+	struct drm_crtc_state *crtc_state;
+	int i;
+
+	/* Set this before check_modeset so allow_modeset and all affected
+	 * connectors/planes are checked. TEST_ONLY never consumes recovery.
+	 */
+	for_each_new_crtc_in_state(state, crtc, crtc_state, i) {
+		if (crtc_state->active &&
+		    dcp_needs_recovery(to_apple_crtc(crtc)->dcp))
+			crtc_state->mode_changed = true;
+	}
+
+	return drm_atomic_helper_check(dev, state);
+}
+
 static const struct drm_mode_config_funcs apple_mode_config_funcs = {
-	.atomic_check		= drm_atomic_helper_check,
+	.atomic_check		= apple_atomic_check,
 	.atomic_commit		= drm_atomic_helper_commit,
 	.fb_create		= drm_gem_fb_create,
 };
