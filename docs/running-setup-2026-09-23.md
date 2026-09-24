@@ -57,6 +57,12 @@ The [September 22 lock/display-wake blackout](idle-wake-blackout-2026-09-22.md)
 remains unresolved. Continued successful use does not establish that it is fixed.
 Future kernel/initramfs/m1n1 updates can still overwrite the experimental setup.
 
+## Public discussion — September 24, 2026
+
+The owner [added a comment to Omarchy Mac issue #336](https://github.com/omacom/omarchy-mac/issues/336#issuecomment-5818617955), which reports a detected-but-black USB-C display after reconnect on a different M2 model. The comment links the [public j493 source demo PR](https://github.com/gregorycoppola/j493-usb-c-display/pull/2) and reports that HDMI reconnect through the USB-C hub, USB-C reconnect, monitor power reconnect, and use of either USB-C port generally restore the picture on this j493 setup. The owner also reports occasional indeterminate display states at apparently random times. No new cycle counts, timings, failure logs, or repeatable trigger were supplied with this comment; reliable recovery is not established, and the j493 result does not resolve the M2 Air report.
+
+The comment discloses that an AI coding agent wrote the new code and that [Asahi's generative AI policy](https://asahilinux.org/llm-policy/) rules out material LLM-assisted contributions. The owner did not submit this as an Asahi PR and asked for guidance on appropriate practice. No response to that question had been recorded when this note was written.
+
 ## Proposed physical demo
 
 1. Show the monitor picture, HDMI cable, adapter label, and occupied Mac port.
